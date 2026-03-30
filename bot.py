@@ -50,9 +50,15 @@ def init_db() -> None:
             question_id INTEGER NOT NULL,
             selected_index INTEGER NOT NULL,
             is_correct INTEGER NOT NULL,
+            is_counted INTEGER NOT NULL DEFAULT 1,
             answered_at TEXT NOT NULL
         )
     """)
+
+    cur.execute("PRAGMA table_info(answers)")
+    columns = [row[1] for row in cur.fetchall()]
+    if "is_counted" not in columns:
+        cur.execute("ALTER TABLE answers ADD COLUMN is_counted INTEGER NOT NULL DEFAULT 1")
 
     conn.commit()
     conn.close()
@@ -113,6 +119,23 @@ def get_question(question_id: int) -> dict | None:
     }
 
 
+def has_counted_answer(user_id: int, question_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM answers
+        WHERE user_id = ? AND question_id = ? AND is_counted = 1
+        LIMIT 1
+        """,
+        (user_id, question_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
 def save_answer(
     user_id: int,
     username: str | None,
@@ -120,15 +143,16 @@ def save_answer(
     question_id: int,
     selected_index: int,
     is_correct: bool,
+    is_counted: bool,
 ) -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO answers (
-            user_id, username, full_name, question_id, selected_index, is_correct, answered_at
+            user_id, username, full_name, question_id, selected_index, is_correct, is_counted, answered_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -137,6 +161,7 @@ def save_answer(
             question_id,
             selected_index,
             1 if is_correct else 0,
+            1 if is_counted else 0,
             now_moscow().isoformat()
         ),
     )
@@ -169,7 +194,7 @@ def get_stats(start_dt: datetime, end_dt: datetime) -> dict:
         """
         SELECT COUNT(*)
         FROM answers
-        WHERE answered_at >= ? AND answered_at < ?
+        WHERE answered_at >= ? AND answered_at < ? AND is_counted = 1
         """,
         (start_str, end_str),
     )
@@ -179,7 +204,7 @@ def get_stats(start_dt: datetime, end_dt: datetime) -> dict:
         """
         SELECT COUNT(DISTINCT user_id)
         FROM answers
-        WHERE answered_at >= ? AND answered_at < ?
+        WHERE answered_at >= ? AND answered_at < ? AND is_counted = 1
         """,
         (start_str, end_str),
     )
@@ -189,7 +214,7 @@ def get_stats(start_dt: datetime, end_dt: datetime) -> dict:
         """
         SELECT COUNT(*)
         FROM answers
-        WHERE answered_at >= ? AND answered_at < ? AND is_correct = 1
+        WHERE answered_at >= ? AND answered_at < ? AND is_correct = 1 AND is_counted = 1
         """,
         (start_str, end_str),
     )
@@ -199,7 +224,7 @@ def get_stats(start_dt: datetime, end_dt: datetime) -> dict:
         """
         SELECT COUNT(*)
         FROM answers
-        WHERE answered_at >= ? AND answered_at < ? AND is_correct = 0
+        WHERE answered_at >= ? AND answered_at < ? AND is_correct = 0 AND is_counted = 1
         """,
         (start_str, end_str),
     )
@@ -211,7 +236,7 @@ def get_stats(start_dt: datetime, end_dt: datetime) -> dict:
             COALESCE(NULLIF(full_name, ''), username, CAST(user_id AS TEXT)) AS user_label,
             COUNT(*) as answers_count
         FROM answers
-        WHERE answered_at >= ? AND answered_at < ?
+        WHERE answered_at >= ? AND answered_at < ? AND is_counted = 1
         GROUP BY user_id, username, full_name
         ORDER BY answers_count DESC
         LIMIT 10
@@ -270,7 +295,7 @@ def get_leaderboard(start_dt: datetime | None = None, end_dt: datetime | None = 
                     1
                 ) AS accuracy
             FROM answers
-            WHERE answered_at >= ? AND answered_at < ?
+            WHERE answered_at >= ? AND answered_at < ? AND is_counted = 1
             GROUP BY user_id, username, full_name
             HAVING COUNT(*) > 0
             ORDER BY correct_answers DESC, accuracy DESC, total_answers DESC, user_label ASC
@@ -291,6 +316,7 @@ def get_leaderboard(start_dt: datetime | None = None, end_dt: datetime | None = 
                     1
                 ) AS accuracy
             FROM answers
+            WHERE is_counted = 1
             GROUP BY user_id, username, full_name
             HAVING COUNT(*) > 0
             ORDER BY correct_answers DESC, accuracy DESC, total_answers DESC, user_label ASC
@@ -327,7 +353,7 @@ def get_question_answer_distribution(question_id: int) -> dict:
         """
         SELECT COUNT(*)
         FROM answers
-        WHERE question_id = ?
+        WHERE question_id = ? AND is_counted = 1
         """,
         (question_id,),
     )
@@ -337,7 +363,7 @@ def get_question_answer_distribution(question_id: int) -> dict:
         """
         SELECT selected_index, COUNT(*)
         FROM answers
-        WHERE question_id = ?
+        WHERE question_id = ? AND is_counted = 1
         GROUP BY selected_index
         """,
         (question_id,),
@@ -481,6 +507,7 @@ async def handle_question_callback(callback: types.CallbackQuery) -> None:
         return
 
     is_correct = selected_index == question["correct_index"]
+    is_counted = not has_counted_answer(callback.from_user.id, question_id)
 
     save_answer(
         user_id=callback.from_user.id,
@@ -489,6 +516,7 @@ async def handle_question_callback(callback: types.CallbackQuery) -> None:
         question_id=question_id,
         selected_index=selected_index,
         is_correct=is_correct,
+        is_counted=is_counted,
     )
 
     answer_stats = get_question_answer_distribution(question_id)
@@ -500,11 +528,16 @@ async def handle_question_callback(callback: types.CallbackQuery) -> None:
     else:
         selected_percent = 0
 
+    counted_note = ""
+    if not is_counted:
+        counted_note = "\n\nℹ️ Повторный ответ не засчитан в статистику и рейтинг."
+
     if is_correct:
         text = (
             f"✅ Верно\n\n"
             f"{question['explanation']}\n\n"
             f"Так ответили: {selected_percent}%"
+            f"{counted_note}"
         )
     else:
         correct_text = question["options"][question["correct_index"]]
@@ -513,6 +546,7 @@ async def handle_question_callback(callback: types.CallbackQuery) -> None:
             f"Правильный ответ: {correct_text}\n\n"
             f"{question['explanation']}\n\n"
             f"Так ответили: {selected_percent}%"
+            f"{counted_note}"
         )
 
     await callback.answer(text, show_alert=True)
