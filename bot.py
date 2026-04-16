@@ -16,7 +16,7 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = "@pt_training_channel"   # например: @pt_training_channel
+CHANNEL_ID = "@@training_05ru_pt"   # например: @pt_training_channel
 ADMIN_IDS = {314601893}                 # сюда вставь свой Telegram user id
 
 DB_PATH = Path("questions.db")
