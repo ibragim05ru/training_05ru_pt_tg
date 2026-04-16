@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import os
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,12 +16,15 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = "@training_05ru_pt"   # например: @pt_training_channel
+CHANNEL_ID = "@pt_training_channel"   # например: @pt_training_channel
 ADMIN_IDS = {314601893}                 # сюда вставь свой Telegram user id
 
 DB_PATH = Path("questions.db")
 RESTORE_WAITING_USERS = set()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+BACKUP_HOUR = 23
+BACKUP_MINUTE = 59
 
 dp = Dispatcher()
 
@@ -601,6 +605,43 @@ def format_activity_by_day(title: str, data: list[tuple[str, int]]) -> str:
     return "\n".join(lines)
 
 
+async def send_daily_backup(bot: Bot) -> None:
+    if not DB_PATH.exists():
+        return
+
+    timestamp = now_moscow().strftime("%Y-%m-%d_%H-%M")
+    backup_copy = Path(f"questions_backup_{timestamp}.db")
+
+    try:
+        shutil.copy(DB_PATH, backup_copy)
+
+        for admin_id in ADMIN_IDS:
+            await bot.send_document(
+                chat_id=admin_id,
+                document=FSInputFile(backup_copy),
+                caption=f"Автоматическая резервная копия базы за {now_moscow().strftime('%d.%m.%Y %H:%M')}"
+            )
+    finally:
+        backup_copy.unlink(missing_ok=True)
+
+
+async def backup_scheduler(bot: Bot) -> None:
+    last_sent_date = None
+
+    while True:
+        now = now_moscow()
+
+        if (
+            now.hour == BACKUP_HOUR
+            and now.minute == BACKUP_MINUTE
+            and last_sent_date != now.date()
+        ):
+            await send_daily_backup(bot)
+            last_sent_date = now.date()
+
+        await asyncio.sleep(20)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
     text = (
@@ -615,7 +656,8 @@ async def cmd_start(message: types.Message) -> None:
 
         "👉 Персонально:\n"
         "/stats_today @username\n"
-        "/stats_week 123456789\n\n"
+        "/stats_week 123456789\n"
+        "/stats_all @username\n\n"
 
         "🏆 <b>РЕЙТИНГ</b>\n"
         "/leaderboard_today — за сегодня\n"
@@ -636,7 +678,10 @@ async def cmd_start(message: types.Message) -> None:
 
         "💾 <b>БАЗА ДАННЫХ</b>\n"
         "/backup_db — скачать базу\n"
-        "/restore_db — восстановить базу"
+        "/restore_db — восстановить базу\n\n"
+
+        "🕛 <b>АВТОБЭКАП</b>\n"
+        "Каждый день в 23:59 по Москве база автоматически отправляется в этот чат."
     )
 
     await message.answer(text)
@@ -659,6 +704,8 @@ async def cmd_help(message: types.Message) -> None:
         "Резервная копия:\n"
         "/backup_db — бот пришлёт файл базы\n"
         "/restore_db — после команды отправь боту файл questions.db\n\n"
+        "Автокопия:\n"
+        "Каждый день в 23:59 по Москве база отправляется в личный чат с ботом.\n\n"
         "Персональная статистика:\n"
         "/stats_today @username\n"
         "/stats_week 123456789\n"
@@ -680,7 +727,7 @@ async def cmd_backup_db(message: types.Message) -> None:
 
     await message.answer_document(
         FSInputFile(DB_PATH),
-        caption="Резервная копия базы данных"
+        caption="Ручная резервная копия базы данных"
     )
 
 
@@ -1042,6 +1089,8 @@ async def main() -> None:
         token=TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
+
+    asyncio.create_task(backup_scheduler(bot))
 
     print("Бот запущен...")
     await dp.start_polling(bot)
