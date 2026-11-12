@@ -9,6 +9,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import psycopg2
+from psycopg2.extras import execute_values
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -16,8 +19,14 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = "@training_05ru_pt"   # например: @pt_training_channel
-ADMIN_IDS = {314601893}                 # сюда вставь свой Telegram user id
+CHANNEL_ID = "@training_05ru_pt"
+ADMIN_IDS = {314601893}
+
+# Очистка строки подключения DATABASE_URL на случай лишних кавычек или префикса psql
+_raw_db_url = os.getenv("DATABASE_URL", "").strip()
+if _raw_db_url.startswith("psql "):
+    _raw_db_url = _raw_db_url[5:].strip()
+DATABASE_URL = _raw_db_url.strip("'").strip('"')
 
 DB_PATH = Path("questions.db")
 RESTORE_WAITING_USERS = set()
@@ -33,7 +42,13 @@ def now_moscow() -> datetime:
     return datetime.now(MOSCOW_TZ)
 
 
-def init_db() -> None:
+def get_pg_conn():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_sqlite_tables() -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -70,6 +85,126 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
+
+
+def sync_sqlite_to_postgres() -> None:
+    if not DATABASE_URL:
+        return
+
+    sqlite_conn = sqlite3.connect(DB_PATH)
+    sqlite_cur = sqlite_conn.cursor()
+
+    sqlite_cur.execute(
+        "SELECT id, question, options_json, correct_index, explanation, created_by, created_at FROM questions"
+    )
+    questions_rows = sqlite_cur.fetchall()
+
+    sqlite_cur.execute(
+        "SELECT id, user_id, username, full_name, question_id, selected_index, is_correct, is_counted, answered_at FROM answers"
+    )
+    answers_rows = sqlite_cur.fetchall()
+    sqlite_conn.close()
+
+    pg_conn = get_pg_conn()
+    try:
+        with pg_conn:
+            with pg_conn.cursor() as pg_cur:
+                pg_cur.execute("TRUNCATE TABLE questions, answers;")
+                if questions_rows:
+                    execute_values(
+                        pg_cur,
+                        """
+                        INSERT INTO questions (id, question, options_json, correct_index, explanation, created_by, created_at)
+                        VALUES %s
+                        """,
+                        questions_rows,
+                    )
+                if answers_rows:
+                    execute_values(
+                        pg_cur,
+                        """
+                        INSERT INTO answers (id, user_id, username, full_name, question_id, selected_index, is_correct, is_counted, answered_at)
+                        VALUES %s
+                        """,
+                        answers_rows,
+                    )
+    finally:
+        pg_conn.close()
+
+
+def init_db() -> None:
+    init_sqlite_tables()
+
+    if not DATABASE_URL:
+        logging.warning("DATABASE_URL не задан. Бот работает только с локальной базой SQLite.")
+        return
+
+    try:
+        pg_conn = get_pg_conn()
+        with pg_conn:
+            with pg_conn.cursor() as pg_cur:
+                pg_cur.execute("""
+                    CREATE TABLE IF NOT EXISTS questions (
+                        id BIGINT PRIMARY KEY,
+                        question TEXT NOT NULL,
+                        options_json TEXT NOT NULL,
+                        correct_index INTEGER NOT NULL,
+                        explanation TEXT NOT NULL,
+                        created_by BIGINT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+                pg_cur.execute("""
+                    CREATE TABLE IF NOT EXISTS answers (
+                        id BIGINT PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        username TEXT,
+                        full_name TEXT,
+                        question_id BIGINT NOT NULL,
+                        selected_index INTEGER NOT NULL,
+                        is_correct INTEGER NOT NULL,
+                        is_counted INTEGER NOT NULL DEFAULT 1,
+                        answered_at TEXT NOT NULL
+                    )
+                """)
+
+                pg_cur.execute("SELECT COUNT(*) FROM questions")
+                pg_q_count = pg_cur.fetchone()[0]
+                pg_cur.execute("SELECT COUNT(*) FROM answers")
+                pg_a_count = pg_cur.fetchone()[0]
+
+                if pg_q_count > 0 or pg_a_count > 0:
+                    pg_cur.execute(
+                        "SELECT id, question, options_json, correct_index, explanation, created_by, created_at FROM questions ORDER BY id"
+                    )
+                    q_rows = pg_cur.fetchall()
+
+                    pg_cur.execute(
+                        "SELECT id, user_id, username, full_name, question_id, selected_index, is_correct, is_counted, answered_at FROM answers ORDER BY id"
+                    )
+                    a_rows = pg_cur.fetchall()
+
+                    sqlite_conn = sqlite3.connect(DB_PATH)
+                    sqlite_cur = sqlite_conn.cursor()
+                    sqlite_cur.execute("DELETE FROM questions")
+                    sqlite_cur.execute("DELETE FROM answers")
+
+                    if q_rows:
+                        sqlite_cur.executemany(
+                            "INSERT INTO questions (id, question, options_json, correct_index, explanation, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            q_rows,
+                        )
+                    if a_rows:
+                        sqlite_cur.executemany(
+                            "INSERT INTO answers (id, user_id, username, full_name, question_id, selected_index, is_correct, is_counted, answered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            a_rows,
+                        )
+                    sqlite_conn.commit()
+                    sqlite_conn.close()
+                    logging.info(f"Данные успешно загружены из облачной БД (вопросов: {len(q_rows)}, ответов: {len(a_rows)}).")
+        pg_conn.close()
+    except Exception as e:
+        logging.error(f"Ошибка синхронизации с облачной БД при запуске: {e}")
 
 
 def make_user_link(user_id: int, username: str | None, full_name: str | None) -> str:
@@ -131,6 +266,9 @@ def save_question(
     explanation: str,
     created_by: int,
 ) -> int:
+    created_at = now_moscow().isoformat()
+    options_json = json.dumps(options, ensure_ascii=False)
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -138,19 +276,30 @@ def save_question(
         INSERT INTO questions (question, options_json, correct_index, explanation, created_by, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (
-            question,
-            json.dumps(options, ensure_ascii=False),
-            correct_index,
-            explanation,
-            created_by,
-            now_moscow().isoformat()
-        ),
+        (question, options_json, correct_index, explanation, created_by, created_at),
     )
-    question_id = cur.lastrowid
+    question_id = int(cur.lastrowid)
     conn.commit()
     conn.close()
-    return int(question_id)
+
+    if DATABASE_URL:
+        try:
+            pg_conn = get_pg_conn()
+            with pg_conn:
+                with pg_conn.cursor() as pg_cur:
+                    pg_cur.execute(
+                        """
+                        INSERT INTO questions (id, question, options_json, correct_index, explanation, created_by, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (question_id, question, options_json, correct_index, explanation, created_by, created_at),
+                    )
+            pg_conn.close()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения вопроса в облачную БД: {e}")
+
+    return question_id
 
 
 def get_question(question_id: int) -> dict | None:
@@ -205,6 +354,10 @@ def save_answer(
     is_correct: bool,
     is_counted: bool,
 ) -> None:
+    answered_at = now_moscow().isoformat()
+    is_correct_int = 1 if is_correct else 0
+    is_counted_int = 1 if is_counted else 0
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -214,19 +367,30 @@ def save_answer(
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            user_id,
-            username,
-            full_name,
-            question_id,
-            selected_index,
-            1 if is_correct else 0,
-            1 if is_counted else 0,
-            now_moscow().isoformat()
-        ),
+        (user_id, username, full_name, question_id, selected_index, is_correct_int, is_counted_int, answered_at),
     )
+    answer_id = int(cur.lastrowid)
     conn.commit()
     conn.close()
+
+    if DATABASE_URL:
+        try:
+            pg_conn = get_pg_conn()
+            with pg_conn:
+                with pg_conn.cursor() as pg_cur:
+                    pg_cur.execute(
+                        """
+                        INSERT INTO answers (
+                            id, user_id, username, full_name, question_id, selected_index, is_correct, is_counted, answered_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (answer_id, user_id, username, full_name, question_id, selected_index, is_correct_int, is_counted_int, answered_at),
+                    )
+            pg_conn.close()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения ответа в облачную БД: {e}")
 
 
 def make_keyboard(question_id: int, options: list[str]) -> InlineKeyboardMarkup:
@@ -256,32 +420,16 @@ def get_stats(start_dt: datetime | None = None, end_dt: datetime | None = None, 
 
     where_clause = " AND ".join(conditions)
 
-    cur.execute(f"""
-        SELECT COUNT(*)
-        FROM answers
-        WHERE {where_clause}
-    """, params)
+    cur.execute(f"SELECT COUNT(*) FROM answers WHERE {where_clause}", params)
     total_answers = cur.fetchone()[0]
 
-    cur.execute(f"""
-        SELECT COUNT(DISTINCT user_id)
-        FROM answers
-        WHERE {where_clause}
-    """, params)
+    cur.execute(f"SELECT COUNT(DISTINCT user_id) FROM answers WHERE {where_clause}", params)
     unique_users = cur.fetchone()[0]
 
-    cur.execute(f"""
-        SELECT COUNT(*)
-        FROM answers
-        WHERE {where_clause} AND is_correct = 1
-    """, params)
+    cur.execute(f"SELECT COUNT(*) FROM answers WHERE {where_clause} AND is_correct = 1", params)
     correct_answers = cur.fetchone()[0]
 
-    cur.execute(f"""
-        SELECT COUNT(*)
-        FROM answers
-        WHERE {where_clause} AND is_correct = 0
-    """, params)
+    cur.execute(f"SELECT COUNT(*) FROM answers WHERE {where_clause} AND is_correct = 0", params)
     wrong_answers = cur.fetchone()[0]
 
     cur.execute(f"""
@@ -345,18 +493,10 @@ def get_user_stats(start_dt: datetime | None, end_dt: datetime | None, user_id: 
 
     where_clause = " AND ".join(conditions)
 
-    cur.execute(f"""
-        SELECT COUNT(*)
-        FROM answers
-        WHERE {where_clause}
-    """, params)
+    cur.execute(f"SELECT COUNT(*) FROM answers WHERE {where_clause}", params)
     total_answers = cur.fetchone()[0]
 
-    cur.execute(f"""
-        SELECT COUNT(*)
-        FROM answers
-        WHERE {where_clause} AND is_correct = 1
-    """, params)
+    cur.execute(f"SELECT COUNT(*) FROM answers WHERE {where_clause} AND is_correct = 1", params)
     correct_answers = cur.fetchone()[0]
 
     wrong_answers = total_answers - correct_answers
@@ -503,11 +643,7 @@ def get_question_answer_distribution(question_id: int) -> dict:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM answers
-        WHERE question_id = ? AND is_counted = 1
-    """, (question_id,))
+    cur.execute("SELECT COUNT(*) FROM answers WHERE question_id = ? AND is_counted = 1", (question_id,))
     total_answers = cur.fetchone()[0]
 
     cur.execute("""
@@ -646,44 +782,35 @@ async def backup_scheduler(bot: Bot) -> None:
 async def cmd_start(message: types.Message) -> None:
     text = (
         "👋 Бот обучения менеджеров\n\n"
-
         "📊 <b>СТАТИСТИКА</b>\n"
         "/stats_today — за сегодня\n"
         "/stats_yesterday — за вчера\n"
         "/stats_week — за 7 дней\n"
         "/stats_month — за 30 дней\n"
         "/stats_all — за всё время\n\n"
-
         "👉 Персонально:\n"
         "/stats_today @username\n"
         "/stats_week 123456789\n"
         "/stats_all @username\n\n"
-
         "🏆 <b>РЕЙТИНГ</b>\n"
         "/leaderboard_today — за сегодня\n"
         "/leaderboard_week — за 7 дней\n"
         "/leaderboard_month — за 30 дней\n"
         "/leaderboard_all — за всё время\n\n"
-
         "📈 <b>АКТИВНОСТЬ</b>\n"
         "/activity_today — по часам (сегодня)\n"
         "/activity_week — по дням (7 дней)\n"
         "/activity_month — по дням (30 дней)\n\n"
-
         "👉 Персонально:\n"
         "/activity_week @username\n\n"
-
         "🧠 <b>ВОПРОСЫ</b>\n"
         "/publish — опубликовать вопрос\n\n"
-
         "💾 <b>БАЗА ДАННЫХ</b>\n"
         "/backup_db — скачать базу\n"
         "/restore_db — восстановить базу\n\n"
-
         "🕛 <b>АВТОБЭКАП</b>\n"
         "Каждый день в 23:59 по Москве база автоматически отправляется в этот чат."
     )
-
     await message.answer(text)
 
 
@@ -740,7 +867,7 @@ async def cmd_restore_db(message: types.Message) -> None:
     RESTORE_WAITING_USERS.add(message.from_user.id)
     await message.answer(
         "Теперь отправь мне файлом базу questions.db.\n\n"
-        "Лучше делать это, когда ботом никто не пользуется."
+        "Бот загрузит её и автоматически сохранит все данные в облачную базу Neon."
     )
 
 
@@ -758,7 +885,7 @@ async def handle_restore_document(message: types.Message, bot: Bot) -> None:
         return
 
     if not document.file_name or not document.file_name.endswith(".db"):
-        await message.answer("Нужен файл базы .db")
+        await message.answer("Нужен файл базы с расширением .db")
         return
 
     temp_path = Path("uploaded_restore.db")
@@ -782,9 +909,11 @@ async def handle_restore_document(message: types.Message, bot: Bot) -> None:
         DB_PATH.unlink(missing_ok=True)
         temp_path.replace(DB_PATH)
 
-        init_db()
+        init_sqlite_tables()
+        sync_sqlite_to_postgres()
+
         RESTORE_WAITING_USERS.discard(message.from_user.id)
-        await message.answer("База успешно восстановлена ✅")
+        await message.answer("База успешно восстановлена и сохранена в облаке ✅")
 
     except Exception as e:
         temp_path.unlink(missing_ok=True)
@@ -1077,6 +1206,18 @@ async def cmd_activity_month(message: types.Message) -> None:
     await handle_activity_command(message, "Активность за 30 дней", start, end, by_hour=False)
 
 
+async def start_dummy_webserver() -> None:
+    """Мини веб-сервер для Render, чтобы бесплатный Web Service видел открытый порт."""
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="Bot is running!"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Веб-сервер для Render запущен на порту {port}")
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
@@ -1084,6 +1225,8 @@ async def main() -> None:
         raise ValueError("Переменная окружения TOKEN не задана")
 
     init_db()
+
+    await start_dummy_webserver()
 
     bot = Bot(
         token=TOKEN,
